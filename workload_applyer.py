@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import torch
-import sys
+import os
 import math
 import time
 from utils.utils import WorkloadWriter, CommGroup, CommType, ReduceOp
@@ -92,6 +92,9 @@ class WorkloadApplyer:
         self.skip_computation = False
         self.always_apply_gemm = False
         self.gemm_iters = 1 if self.always_apply_gemm else 50
+        # Capped buffer size to avoid OOM
+        self.bucket_cap_mb = int(float(os.getenv('BUCKET_CAP_MB', '25')) * 1024 * 1024)
+        max_msg_size = min(max_msg_size, self.bucket_cap_mb // 2)
         self.buffer = torch.empty(
             (max_msg_size,), dtype=torch.bfloat16, device=self.device
         )
@@ -217,47 +220,76 @@ class WorkloadApplyer:
 
     def _apply_p2pcommunication(self, item):
         ops = []
-        tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        # tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        num_residual = (item.msg_size // 2) % self.buffer.numel()
+        num_chunks = (item.msg_size // 2) // self.buffer.numel()
+        tensor = torch.narrow(self.buffer, 0, 0, num_residual)
         if item.additional == "send_prev":
             if self._get_pipeline_parallel_rank() != 0:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, tensor, self._get_pipeline_prev_rank()
-                )
-                ops.append(send_prev_op)
+                if num_residual:
+                    send_prev_op = torch.distributed.P2POp(
+                        torch.distributed.isend, tensor, self._get_pipeline_prev_rank()
+                    )
+                    ops.append(send_prev_op)
+                for _ in range(0, num_chunks):
+                    send_prev_op = torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        self.buffer,
+                        self._get_pipeline_prev_rank(),
+                    )
+                    ops.append(send_prev_op)
             else:
                 pass
         if item.additional == "send_next":
             if self._get_pipeline_parallel_rank() != self.args.pipeline_model_parallel - 1:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, tensor, self._get_pipeline_next_rank()
-                )
-                ops.append(send_next_op)
+                if num_residual:
+                    send_next_op = torch.distributed.P2POp(
+                        torch.distributed.isend, tensor, self._get_pipeline_next_rank()
+                    )
+                    ops.append(send_next_op)
+                for _ in range(0, num_chunks):
+                    send_next_op = torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        self.buffer,
+                        self._get_pipeline_next_rank(),
+                    )
+                    ops.append(send_next_op)
             else:
                 pass
         if item.additional == "recv_prev":
             if self._get_pipeline_parallel_rank() != 0:
-                tensor_recv_prev = torch.empty(
-                    item.msg_size // 2, dtype=torch.bfloat16, device=self.device
-                )
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    tensor_recv_prev,
-                    self._get_pipeline_prev_rank(),
-                )
-                ops.append(recv_prev_op)
+                if num_residual:
+                    recv_prev_op = torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        torch.narrow(self.buffer, 0, 0, num_residual),
+                        self._get_pipeline_prev_rank(),
+                    )
+                    ops.append(recv_prev_op)
+                for _ in range(0, num_chunks):
+                    recv_prev_op = torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        self.buffer,
+                        self._get_pipeline_prev_rank(),
+                    )
+                    ops.append(recv_prev_op)
             else:
                 pass
         if item.additional == "recv_next":
             if self._get_pipeline_parallel_rank() != self.args.pipeline_model_parallel - 1:
-                tensor_recv_next = torch.empty(
-                    item.msg_size // 2, dtype=torch.bfloat16, device=self.device
-                )
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    tensor_recv_next,
-                    self._get_pipeline_next_rank(),
-                )
-                ops.append(recv_next_op)
+                if num_residual:
+                    recv_next_op = torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        torch.narrow(self.buffer, 0, 0, num_residual),
+                        self._get_pipeline_next_rank(),
+                    )
+                    ops.append(recv_next_op)
+                for _ in range(0, num_chunks):
+                    recv_next_op = torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        self.buffer,
+                        self._get_pipeline_next_rank(),
+                    )
+                    ops.append(recv_next_op)
             else:
                 pass
         if len(ops) > 0:
@@ -272,36 +304,66 @@ class WorkloadApplyer:
 
     @bench_logger.log_timing("comm")
     def _apply_broadcast(self, item):
-        tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        # tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        num_residual = (item.msg_size // 2) % self.buffer.numel()
+        num_chunks = (item.msg_size // 2) // self.buffer.numel()
+        tensor = torch.narrow(self.buffer, 0, 0, num_residual)
         group = self.comm_group_info[item.comm_group]
         src = torch.distributed.get_global_rank(group, 0)
-        return torch.distributed.broadcast(
-            tensor=tensor, src=src, group=group, async_op=False
-        )
+        # return torch.distributed.broadcast(
+        #     tensor=tensor, src=src, group=group, async_op=False
+        # )
+        ops = []
+        if num_residual:
+            ops.append(torch.distributed.broadcast(tensor=tensor, src=src, group=group, async_op=True))
+        for _ in range(0, num_chunks):
+            ops.append(torch.distributed.broadcast(tensor=self.buffer, src=src, group=group, async_op=True))
+        for op in ops:
+            op.wait()
 
     @bench_logger.log_timing("comm")
     def _apply_reduce(self, item):
-        tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        # tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        num_residual = (item.msg_size // 2) % self.buffer.numel()
+        num_chunks = (item.msg_size // 2) // self.buffer.numel()
+        tensor = torch.narrow(self.buffer, 0, 0, num_residual)
         group = self.comm_group_info[item.comm_group]
         dst = item.dst
-        return torch.distributed.reduce(
-            tensor=tensor,
-            dst=dst,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-            async_op=False,
-        )
+        # return torch.distributed.reduce(
+        #     tensor=tensor,
+        #     dst=dst,
+        #     op=torch.distributed.ReduceOp.SUM,
+        #     group=group,
+        #     async_op=False,
+        # )
+        ops = []
+        if num_residual:
+            ops.append(torch.distributed.reduce(tensor=tensor, dst=dst, op=torch.distributed.ReduceOp.SUM, group=group, async_op=True))
+        for _ in range(0, num_chunks):
+            ops.append(torch.distributed.reduce(tensor=self.buffer, dst=dst, op=torch.distributed.ReduceOp.SUM, group=group, async_op=True))
+        for op in ops:
+            op.wait()
 
     @bench_logger.log_timing("comm")
     def _apply_all_reduce(self, item):
-        tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        # tensor = torch.narrow(self.buffer, 0, 0, item.msg_size // 2)
+        num_residual = (item.msg_size // 2) % self.buffer.numel()
+        num_chunks = (item.msg_size // 2) // self.buffer.numel()
+        tensor = torch.narrow(self.buffer, 0, 0, num_residual)
         group = self.comm_group_info[item.comm_group]
-        return torch.distributed.all_reduce(
-            tensor=tensor,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-            async_op=False,
-        )
+        # return torch.distributed.all_reduce(
+        #     tensor=tensor,
+        #     op=torch.distributed.ReduceOp.SUM,
+        #     group=group,
+        #     async_op=False,
+        # )
+        ops = []
+        if num_residual:
+            ops.append(torch.distributed.all_reduce(tensor=tensor, op=torch.distributed.ReduceOp.SUM, group=group, async_op=True))
+        for _ in range(0, num_chunks):
+            ops.append(torch.distributed.all_reduce(tensor=self.buffer, op=torch.distributed.ReduceOp.SUM, group=group, async_op=True))
+        for op in ops:
+            op.wait()
 
     @bench_logger.log_timing("comm")
     def _apply_all_gather(self, item):
@@ -313,15 +375,38 @@ class WorkloadApplyer:
             else 0
         )
         num_elements = num_elements + padding_size
-        output_tensor = torch.narrow(self.buffer, 0, 0, num_elements)
-        input_tensor_size = output_tensor.numel() // group.size()
-        group_rank = torch.distributed.get_group_rank(group, self.rank)
-        input_tensor = torch.narrow(
-            output_tensor, 0, group_rank * input_tensor_size, input_tensor_size
-        )
-        return torch.distributed.all_gather_into_tensor(
-            output_tensor, input_tensor, group=group, async_op=False
-        )
+        # output_tensor = torch.narrow(self.buffer, 0, 0, num_elements)
+        # input_tensor_size = output_tensor.numel() // group.size()
+        # group_rank = torch.distributed.get_group_rank(group, self.rank)
+        # input_tensor = torch.narrow(
+        #     output_tensor, 0, group_rank * input_tensor_size, input_tensor_size
+        # )
+        # return torch.distributed.all_gather_into_tensor(
+        #     output_tensor, input_tensor, group=group, async_op=False
+        # )
+        buffer_size = self.buffer.numel() - self.buffer.numel() % group.size()
+        num_residual = num_elements % buffer_size
+        num_chunks = num_elements // buffer_size
+        ops = []
+        if num_residual:
+            output_tensor = torch.narrow(self.buffer, 0, 0, num_residual)
+            input_tensor_size = output_tensor.numel() // group.size()
+            group_rank = torch.distributed.get_group_rank(group, self.rank)
+            input_tensor = torch.narrow(
+                output_tensor, 0, group_rank * input_tensor_size, input_tensor_size
+            )
+            ops.append(torch.distributed.all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=True))
+        for _ in range(0, num_chunks):
+            output_tensor = torch.narrow(self.buffer, 0, 0, buffer_size)
+            input_tensor_size = output_tensor.numel() // group.size()
+            group_rank = torch.distributed.get_group_rank(group, self.rank)
+            input_tensor = torch.narrow(
+                output_tensor, 0, group_rank * input_tensor_size, input_tensor_size
+            )
+            ops.append(torch.distributed.all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=True))
+        for op in ops:
+            op.wait()
+
     @bench_logger.log_timing("comm")
     def _overlap(self, item):
         item.additional = 'overlap'
@@ -336,31 +421,72 @@ class WorkloadApplyer:
             else 0
         )
         num_elements = num_elements + padding_size
-        input_tensor = torch.narrow(self.buffer, 0, 0, num_elements)
-        group = self.comm_group_info[item.comm_group]
-        output_tensor_size = input_tensor.numel() // group.size()
-        group_rank = torch.distributed.get_group_rank(group, self.rank)
-        output_tensor = torch.narrow(
-            input_tensor, 0, group_rank * output_tensor_size, output_tensor_size
-        )
-        return torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=group, async_op=False
-        )
+        # input_tensor = torch.narrow(self.buffer, 0, 0, num_elements)
+        # group = self.comm_group_info[item.comm_group]
+        # output_tensor_size = input_tensor.numel() // group.size()
+        # group_rank = torch.distributed.get_group_rank(group, self.rank)
+        # output_tensor = torch.narrow(
+        #     input_tensor, 0, group_rank * output_tensor_size, output_tensor_size
+        # )
+        # return torch.distributed.reduce_scatter_tensor(
+        #     output_tensor, input_tensor, group=group, async_op=False
+        # )
+        buffer_size = self.buffer.numel() - self.buffer.numel() % group.size()
+        num_residual = num_elements % buffer_size
+        num_chunks = num_elements // buffer_size
+        ops = []
+        if num_residual:
+            input_tensor = torch.narrow(self.buffer, 0, 0, num_residual)
+            output_tensor_size = input_tensor.numel() // group.size()
+            group_rank = torch.distributed.get_group_rank(group, self.rank)
+            output_tensor = torch.narrow(
+                input_tensor, 0, group_rank * output_tensor_size, output_tensor_size
+            )
+            ops.append(torch.distributed.reduce_scatter_tensor(output_tensor, input_tensor, group=group, async_op=True))
+        for _ in range(0, num_chunks):
+            input_tensor = torch.narrow(self.buffer, 0, 0, buffer_size)
+            output_tensor_size = input_tensor.numel() // group.size()
+            group_rank = torch.distributed.get_group_rank(group, self.rank)
+            output_tensor = torch.narrow(
+                input_tensor, 0, group_rank * output_tensor_size, output_tensor_size
+            )
+            ops.append(torch.distributed.reduce_scatter_tensor(output_tensor, input_tensor, group=group, async_op=True))
+        for op in ops:
+            op.wait()
 
     @bench_logger.log_timing("comm")
     def _apply_all_to_all(self, item):
         group = self.comm_group_info[item.comm_group]
         num_elements = item.msg_size // 2
-        input_tensor = torch.narrow(self.buffer, 0, 0, num_elements)
-        # output_tensor = torch.narrow(self.buffer, 0, 0 , num_elements)
-        output_tensor = torch.empty(
-            num_elements * group.size(),
-            dtype=self.buffer.dtype,
-            device=self.buffer.device,
-        )
-        return torch.distributed.all_to_all_single(
-            output_tensor, input_tensor, group=group
-        )
+        # input_tensor = torch.narrow(self.buffer, 0, 0, num_elements)
+        # # output_tensor = torch.narrow(self.buffer, 0, 0 , num_elements)
+        # output_tensor = torch.empty(
+        #     num_elements * group.size(),
+        #     dtype=self.buffer.dtype,
+        #     device=self.buffer.device,
+        # )
+        # return torch.distributed.all_to_all_single(
+        #     output_tensor, input_tensor, group=group
+        # )
+        
+        # We need the non-overlapping input and output buffers
+        buffer_size = self.buffer.numel() // 2
+        buffer_size = buffer_size - buffer_size % group.size()
+        num_chunks = num_elements // buffer_size
+        num_residual = num_elements % buffer_size
+        ops = []
+        if num_residual:
+            input_tensor = torch.narrow(self.buffer, 0, 0, num_residual)
+            output_tensor = torch.narrow(
+              self.buffer, 0, buffer_size, num_residual)
+            ops.append(torch.distributed.all_to_all_single(output_tensor, input_tensor, group=group, async_op=True))
+        for _ in range(0, num_chunks):
+            input_tensor = torch.narrow(self.buffer, 0, 0, buffer_size)
+            output_tensor = torch.narrow(
+              self.buffer, 0, buffer_size, buffer_size)
+            ops.append(torch.distributed.all_to_all_single(output_tensor, input_tensor, group=group, async_op=True))
+        for op in ops:
+            op.wait()
 
     @bench_logger.log_timing("comp")
     def _apply_computation(self, item):

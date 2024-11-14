@@ -37,10 +37,21 @@ def get_docker_env_rank(filename):
             return len(ip_list), ip_list.index(ip), ip_list[0], 12345
     return -1, -1, -1, -1
 
+def get_gpu_memory_in_mib():
+    try:
+      result = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'])
+      memory = [int(x) for x in result.decode('utf-8').strip().split('\n')]
+      return min(memory)
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
 
 IPLIST = "/home/ding/iplist"  # Change it to /path/to/iplist, e.g., /root/iplist
 AICB_DIR = "/home/ding/aicb" # Change it to /path/to/aicb, e.g., /root/aicb
 IMAGE_NAME = "nvcr.io/nvidia/pytorch:24.06-py3"  # Change it to your docker image name, e.g., nvcr.io/nvidia/pytorch:xx.xx-py3
+MEMORY_CAP_RATIO = 0.8 # How much of the GPU memory is allowed to be used? Should be in [0, 1]
+
 
 if IPLIST == "DUMMY_IPLIST" or AICB_DIR == "DUMMY_AICB_DIR" or IMAGE_NAME == "DUMMY_IMAGE_NAME":
     sys.stderr.write(__doc__)
@@ -48,6 +59,8 @@ if IPLIST == "DUMMY_IPLIST" or AICB_DIR == "DUMMY_AICB_DIR" or IMAGE_NAME == "DU
 
 WORLD_SIZE, RANK, MASTER_ADDR, MASTER_PORT = get_docker_env_rank(IPLIST)
 AICB_DIR_base = os.path.basename(AICB_DIR)
+BUCKET_CAP_MB = int(get_gpu_memory_in_mib() * MEMORY_CAP_RATIO)
+
 command = f"""docker run --name aicb_test --gpus all --privileged \
 --ulimit memlock=-1 --ulimit stack=67108864 \
 --init -i --shm-size=4g --network=host --rm \
@@ -56,6 +69,7 @@ command = f"""docker run --name aicb_test --gpus all --privileged \
 -e MASTER_ADDR={MASTER_ADDR} \
 -e MASTER_PORT={MASTER_PORT} \
 -e NCCL_SOCKET_IFNAME=ens255f0np0 \
+-e BUCKET_CAP_MB={BUCKET_CAP_MB} \
 -v {AICB_DIR}:/workspace/{AICB_DIR_base} \
 {IMAGE_NAME} /bin/sh -c 'cd /workspace/{AICB_DIR_base} && pwd && python run_suites.py'
 """ # Change the settings in run_suites.py to select the workload you want
