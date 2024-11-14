@@ -73,6 +73,17 @@ class WorkloadApplyer:
                 for item in self.workload.workload
             ]
         )
+
+        with open('workload_applyer.log', 'w') as f:
+            msg_sizes = set()
+            f.write(f"max_msg_size: {max_msg_size}\n")
+            for item in self.workload.workload:
+                if isinstance(item.msg_size, int) and item.msg_size == max_msg_size:
+                    f.write("[Max msg size] ")
+                f.write(f"{item}\n")
+                msg_sizes.add(item.msg_size)
+            f.write(f"msg_sizes: {msg_sizes}\n")
+
         self.gemm_cache = {}
         self.computation_aiob = False
         if args.aiob_enable and args.frame == "Megatron":

@@ -74,11 +74,6 @@ class LogItem:
     def view_as_csv_line(self):
         return ",".join([str(getattr(self, k)) for k in self.__dict__.keys()])
 
-    def __str__(self):
-        if self.is_workload():
-            return "None"
-        return "None"
-
 
 def _print_stage_log(stage_name: str, stage_count: int, comm_type_info: Dict, primary_key: List[str], agg_key: List[str], performance_key: List[str], busbw_key: List[str]):
     header = f"{'Comm_Type':<15} {'Comm_Group':<12} {'Message_Size':<12} {'Count':<12} {'Avg_Elapsed_Time ± Std ':<24} {'Avg_BusBw ± Std':<24}\n"

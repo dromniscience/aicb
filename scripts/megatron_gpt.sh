@@ -141,14 +141,14 @@ case $model_size in
     num_layers=96
     hidden_size=12288
     num_attention_heads=96
-    tensor_model_parallel_size=8
+    # tensor_model_parallel_size=8
     ;;
   22)
     model_name=gpt_22B
     num_layers=48
     hidden_size=6144
     num_attention_heads=64
-    tensor_model_parallel_size=8
+    # tensor_model_parallel_size=8
     ;;
   13)
     model_name=gpt_13B
@@ -168,8 +168,8 @@ case $model_size in
     hidden_size=16384
     ffn_hidden_size=53248
     num_attention_heads=128
-    tensor_model_parallel_size=8
-    pipeline_model_parallel=16
+    # tensor_model_parallel_size=8
+    # pipeline_model_parallel=16
     ;;
   65)
     model_name=llama_65B
@@ -177,8 +177,8 @@ case $model_size in
     hidden_size=8192
     ffn_hidden_size=28672
     num_attention_heads=64
-    tensor_model_parallel_size=8
-    pipeline_model_parallel=2
+    # tensor_model_parallel_size=8
+    # pipeline_model_parallel=2
     ;;
   moe)
     model_name=Mixtral_8*7B
@@ -186,7 +186,7 @@ case $model_size in
     hidden_size=4096
     num_attention_heads=32
     ffn_hidden_size=14336
-    tensor_model_parallel_size=2
+    # tensor_model_parallel_size=2
     moe_enable=--moe_enable
     grouped_gemm=--moe_grouped_gemm
     ;;

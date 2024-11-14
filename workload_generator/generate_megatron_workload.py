@@ -18,7 +18,7 @@ python -m workload_generator.megatron_workload \
   --num_layers=32 --seq_length=2048 --hidden_size=4096 --epoch_num=2 --use-distributed-optimizer --enable_sequence_parallel
 """
 from utils.utils import CommGroup, CommType, get_params, WorkloadWriter
-#import torch
+import torch
 from workload_generator.workload_generator import WorkloadGenerator
 from workload_generator.mocked_model.MockedMegatron import MegatronModel
 from log_analyzer.log import LogItem

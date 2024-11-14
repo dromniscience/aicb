@@ -38,9 +38,9 @@ def get_docker_env_rank(filename):
     return -1, -1, -1, -1
 
 
-IPLIST = "DUMMY_IPLIST"  # Change it to /path/to/iplist, e.g., /root/iplist
-AICB_DIR = "DUMMY_AICB_DIR" # Change it to /path/to/aicb, e.g., /root/aicb
-IMAGE_NAME = "DUMMY_IMAGE_NAME"  # Change it to your docker image name, e.g., nvcr.io/nvidia/pytorch:xx.xx-py3
+IPLIST = "/home/ding/iplist"  # Change it to /path/to/iplist, e.g., /root/iplist
+AICB_DIR = "/home/ding/aicb" # Change it to /path/to/aicb, e.g., /root/aicb
+IMAGE_NAME = "nvcr.io/nvidia/pytorch:24.06-py3"  # Change it to your docker image name, e.g., nvcr.io/nvidia/pytorch:xx.xx-py3
 
 if IPLIST == "DUMMY_IPLIST" or AICB_DIR == "DUMMY_AICB_DIR" or IMAGE_NAME == "DUMMY_IMAGE_NAME":
     sys.stderr.write(__doc__)
@@ -55,6 +55,7 @@ command = f"""docker run --name aicb_test --gpus all --privileged \
 -e RANK={RANK} \
 -e MASTER_ADDR={MASTER_ADDR} \
 -e MASTER_PORT={MASTER_PORT} \
+-e NCCL_SOCKET_IFNAME=ens255f0np0 \
 -v {AICB_DIR}:/workspace/{AICB_DIR_base} \
 {IMAGE_NAME} /bin/sh -c 'cd /workspace/{AICB_DIR_base} && pwd && python run_suites.py'
 """ # Change the settings in run_suites.py to select the workload you want
